@@ -1,0 +1,47 @@
+version: '3.8'
+services:
+  # 1) Object storage (S3-compatible)
+  minio:
+    image: minio/minio:latest
+    environment:
+      MINIO_ACCESS_KEY: minio
+      MINIO_SECRET_KEY: minio123
+    command: server /data
+    ports:
+      - "9000:9000"
+    volumes:
+      - /home/maxserver/ai/fullstack-ai/minio_data:/data
+
+  # 2) Redis queue
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  # 3) API server (FastAPI)
+  api:
+    build: ./backend
+    ports:
+      - "8000:8000"
+    environment:
+      MINIO_URL: http://minio:9000
+      MINIO_ACCESS_KEY: minio
+      MINIO_SECRET_KEY: minio123
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      - minio
+      - redis
+
+  # 4) Worker (RQ)
+  worker:
+    build: ./worker
+    runtime: nvidia
+    environment:
+      MINIO_URL: http://minio:9000
+      MINIO_ACCESS_KEY: minio
+      MINIO_SECRET_KEY: minio123
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      - minio
+      - redis
+
