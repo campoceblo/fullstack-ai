@@ -1,5 +1,7 @@
-boto3
-rq==1.9.0
-F5-TTS==1.1.4
+rq
+git+https://github.com/resemble-ai/chatterbox.git@main 
+numpy     
+scipy       
+ffmpeg-python  
 pydub
 ffmpeg
