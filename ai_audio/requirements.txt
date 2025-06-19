@@ -2,7 +2,11 @@ fastapi==0.104.1
 uvicorn[standard]==0.23.2
 sqlalchemy==2.0.23
 psycopg2-binary==2.9.9
-pika==1.3.2
 minio==7.1.15
+requests==2.31.0
+torch==2.6.0
+torchaudio==2.6.0
+torchvision
 python-dotenv==1.0.0
 python-multipart
+transformers

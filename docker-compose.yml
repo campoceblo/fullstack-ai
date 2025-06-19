@@ -1,47 +1,148 @@
-version: '3.8'
+version: '3.9'
+
+networks:
+  appnet:
+    driver: bridge
+
+volumes:
+  minio-data:
+  postgres-data:
+
 services:
-  # 1) Object storage (S3-compatible)
   minio:
     image: minio/minio:latest
+    container_name: minio
     environment:
-      MINIO_ACCESS_KEY: minio
-      MINIO_SECRET_KEY: minio123
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: minio123
     command: server /data
     ports:
       - "9000:9000"
+      - "9001:9001"
     volumes:
-      - /home/maxserver/ai/fullstack-ai/minio_data:/data
+      - minio-data:/data
+    networks:
+      - appnet
 
-  # 2) Redis queue
-  redis:
-    image: redis:7-alpine
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
     ports:
-      - "6379:6379"
+      - "5672:5672"
+      - "15672:15672"
+    networks:
+      - appnet
 
-  # 3) API server (FastAPI)
+  postgres:
+    image: postgres:15
+    container_name: postgres
+    environment:
+      POSTGRES_USER: root
+      POSTGRES_PASSWORD: admin
+      POSTGRES_DB: pgdb
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - appnet
+
   api:
-    build: ./backend
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: fastapi-app
     ports:
-      - "8000:8000"
+      - "8001:8000"
     environment:
       MINIO_URL: http://minio:9000
       MINIO_ACCESS_KEY: minio
       MINIO_SECRET_KEY: minio123
-      REDIS_URL: redis://redis:6379/0
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      POSTGRES_URL: postgresql://root:admin@postgres:5432/pgdb
     depends_on:
       - minio
-      - redis
+      - rabbitmq
+      - postgres
+    networks:
+      - appnet
 
-  # 4) Worker (RQ)
   worker:
-    build: ./worker
-    runtime: nvidia
+    build:
+      context: ./worker
+      dockerfile: Dockerfile
+    container_name: worker
+    depends_on:
+      - rabbitmq
+      - minio
+      - postgres
+      - api
     environment:
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
       MINIO_URL: http://minio:9000
       MINIO_ACCESS_KEY: minio
       MINIO_SECRET_KEY: minio123
-      REDIS_URL: redis://redis:6379/0
-    depends_on:
-      - minio
-      - redis
+      POSTGRES_URL: postgresql://root:admin@postgres:5432/pgdb
+    networks:
+      - appnet
 
+  ai_audio:
+    build:
+      context: ./ai_audio
+      dockerfile: Dockerfile
+    container_name: ai_audio
+    depends_on:
+      - rabbitmq
+      - minio
+      - postgres
+      - api
+    environment:
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      MINIO_URL: http://minio:9000
+      MINIO_ACCESS_KEY: minio
+      MINIO_SECRET_KEY: minio123
+      POSTGRES_URL: postgresql://root:admin@postgres:5432/pgdb
+    gpus: all
+    networks:
+      - appnet
+
+  ai_video:
+    build:
+      context: ./ai_video
+      dockerfile: Dockerfile
+    container_name: ai_video
+    depends_on:
+      - ai_audio
+      - rabbitmq
+      - minio
+      - postgres
+      - api
+    environment:
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      MINIO_URL: http://minio:9000
+      MINIO_ACCESS_KEY: minio
+      MINIO_SECRET_KEY: minio123
+      POSTGRES_URL: postgresql://root:admin@postgres:5432/pgdb
+      LATENTSYNC_PATH: /app/LatentSync
+      PYTHONUNBUFFERED: 1
+    volumes:
+      - ./ai_video/LatentSync:/app/LatentSync
+    gpus: all
+
+    networks:
+      - appnet
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: vue-frontend
+    ports:
+      - "8000:80"
+    depends_on:
+      - api
+    networks:
+      - appnet  

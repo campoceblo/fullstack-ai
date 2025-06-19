@@ -1,60 +1,71 @@
 import os
-from redis import Redis
-from rq import Worker, Queue, Connection
-import boto3
-import shutil
-import torchaudio as ta
+import pika
+import requests
+from sqlalchemy import create_engine, text
+from sqlalchemy.orm import sessionmaker
+from dotenv import load_dotenv
+import socket 
 
-# Chatterbox import
-from chatterbox.tts import ChatterboxTTS
+load_dotenv()
 
-# ─── Init TTS model once ───────────────────────────────────────────────────────
-# loads the pretrained model onto GPU (or CPU if you prefer)
-model = ChatterboxTTS.from_pretrained(device="cuda")
-
-# ─── Init Redis + RQ ───────────────────────────────────────────────────────────
-redis_conn = Redis.from_url(os.getenv("REDIS_URL"))
-q = Queue(connection=redis_conn)
-
-# ─── Init S3 (MinIO) client ────────────────────────────────────────────────────
-s3 = boto3.client(
-    "s3",
-    endpoint_url=os.getenv("MINIO_URL"),
-    aws_access_key_id=os.getenv("MINIO_ACCESS_KEY"),
-    aws_secret_access_key=os.getenv("MINIO_SECRET_KEY"),
-)
-BUCKET = "tasks"
+DATABASE_URL = os.getenv("POSTGRES_URL", "postgresql://root:admin@postgres:5432/pgdb")
+engine = create_engine(DATABASE_URL, isolation_level="AUTOCOMMIT")
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 def process_job(job_id):
-    # 1) Download the uploaded audio (optional prompt)
-    audio_path = f"/tmp/{job_id}_audio.wav"
-    s3.download_file(BUCKET, f"{job_id}/audio", audio_path)
 
-    # 2) Download & read the user’s text
-    text_path = f"/tmp/{job_id}_text.txt"
-    s3.download_file(BUCKET, f"{job_id}/text", text_path)
-    with open(text_path, "r", encoding="utf-8") as f:
-        gen_text = f.read().strip()
-    if not gen_text:
-        raise ValueError(f"Job {job_id} had empty text")
+    with SessionLocal() as db:
+        db.execute(
+            text("UPDATE jobs SET status = 'PROCESSING_AUDIO' WHERE id = :job_id"),
+            {"job_id": job_id}
+        )
 
-    # 3) Generate audio with ChatterboxTTS
-    #    If you want style transfer, pass audio_prompt_path=audio_path
-    wav_tensor = model.generate(gen_text, audio_prompt_path=audio_path)
+    audio_service_url = "http://ai_audio:8000/process_audio"
+    print(f"Worker: Sending job {job_id} to ai_audio")
+    response_audio = requests.post(audio_service_url, data={"job_id": job_id})
+    print(f"Worker: ai_audio response {response_audio.status_code} {response_audio.text}")
 
-    # 4) Save to WAV on local temp
-    out_wav = f"/tmp/{job_id}_out.wav"
-    ta.save(out_wav, wav_tensor, model.sr)
+    return response_audio.status_code == 200
 
-    # 5) Upload WAV back to MinIO with .wav key
-    with open(out_wav, "rb") as f:
-        s3.upload_fileobj(f, BUCKET, f"{job_id}/output.wav")
+def callback(ch, method, properties, body):
+    job_id = int(body)
+    print(f"Received job: {job_id}")
+    success = process_job(job_id)
+    ch.basic_ack(delivery_tag=method.delivery_tag)
+    if success:
+        print(f"Job {job_id} sent to ai_audio successfully")
+    else:
+        print(f"Job {job_id} failed to send to ai_audio")
 
-    # 6) (Optional) Copy to a host-visible folder
-    os.makedirs("./output", exist_ok=True)
-    shutil.copy(out_wav, "./output/output.wav")
+def main():
+    rabbitmq_url = os.getenv("RABBITMQ_URL", "amqp://guest:guest@rabbitmq:5672/")
+    print(f"Connecting to RabbitMQ at {rabbitmq_url} ...")
 
-# ─── Worker loop ───────────────────────────────────────────────────────────────
-if __name__ == '__main__':
-    with Connection(redis_conn):
-        Worker(q).work()
+
+    for _ in range(10):
+        try:
+            params = pika.URLParameters(rabbitmq_url)
+            params.heartbeat = 600  
+            connection = pika.BlockingConnection(params)
+            break
+        except pika.exceptions.AMQPConnectionError:
+            print(f"Waiting for RabbitMQ to be ready at {rabbitmq_url} ...")
+            import time
+            time.sleep(3)
+        except Exception as e:
+            print(f"Error connecting to RabbitMQ at {rabbitmq_url}: {e}")
+            import time
+            time.sleep(3)
+    else:
+        print(f"Failed to connect to RabbitMQ at {rabbitmq_url} after multiple attempts.")
+        return
+
+    channel = connection.channel()
+    channel.queue_declare(queue='job_queue')
+    channel.basic_qos(prefetch_count=1)
+    channel.basic_consume(queue='job_queue', on_message_callback=callback)
+    print("Worker started. Waiting for jobs...")
+    channel.start_consuming()
+
+if __name__ == "__main__":
+    main()
